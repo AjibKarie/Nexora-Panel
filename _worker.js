@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.2.0";
+const CURRENT_VERSION = "2.3.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -23,7 +23,8 @@ const SYSTEM_DEFAULTS = {
     deviceId: "",
     mode: "alpha",
     agent: "chrome",
-    socketPort: "443",
+    socketPorts: "443",
+    customDns: "https://cloudflare-dns.com/dns-query",
     resolveIp: "1.1.1.1",
     cascade: "",
     enableOpt1: false,
@@ -106,8 +107,21 @@ function getTrojanHash(uuid) {
 function trackUsage(uuid, bytes, env, ctx) {
     if (!sysUsageCache) sysUsageCache = { users: {} };
     if (!sysUsageCache.users) sysUsageCache.users = {};
-    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { b: 0 };
-    sysUsageCache.users[uuid].b += bytes;
+    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+    
+    let u = sysUsageCache.users[uuid];
+    let today = new Date().toISOString().split('T')[0];
+    if (u.lastDay !== today) {
+        u.dReqs = 0;
+        u.lastDay = today;
+    }
+    if (u.reqs === undefined) u.reqs = 0;
+    if (u.dReqs === undefined) u.dReqs = 0;
+
+    if (bytes === 0) {
+        u.reqs += 1;
+        u.dReqs += 1;
+    }
     
     const now = Date.now();
     if (now - lastSysUsageSync > 30000) {
@@ -393,7 +407,7 @@ async function handleConfigSync(request, env, ctx) {
         await d1Put(env, "sys_config", JSON.stringify(nextConfig));
 
         if (!data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
-            let nodes = nextConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean);
+            let nodes = nextConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean);
             let currentHost = new URL(request.url).hostname;
             nodes.forEach(node => {
                 if(node !== currentHost) {
@@ -505,29 +519,31 @@ async function handleTelegramWebhook(request, env, hostName) {
                     if(!sysConfig.users || sysConfig.users.length === 0) umsg += "کاربری یافت نشد.";
                     else {
                         sysConfig.users.forEach(u => {
-                            let ub = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()]?.b || 0;
-                            let mb = (ub / (1024*1024)).toFixed(2);
-                            umsg += `👤 ${u.name}\nUUID: ${u.id}\nمصرف: ${mb} MB ${u.limitGb ? '/ ' + u.limitGb + ' GB' : ''}\n\n`;
+                            let sysU = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()] || {};
+                            let reqs = sysU.reqs || 0;
+                            let dReqs = sysU.lastDay === new Date().toISOString().split('T')[0] ? (sysU.dReqs || 0) : 0;
+                            umsg += `👤 ${u.name}\nUUID: ${u.id}\nدرخواست کل: ${reqs} ${u.limitTotalReq ? '/ ' + u.limitTotalReq : ''}\nدرخواست روزانه: ${dReqs} ${u.limitDailyReq ? '/ ' + u.limitDailyReq : ''}\n\n`;
                         });
                     }
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: umsg }) });
                 } else if (text.startsWith("/adduser")) {
                     const parts = text.split(" ");
                     if(parts.length < 2) {
-                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "طرز استفاده: /adduser [name] [gb_limit] [days_limit]" }) });
+                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "طرز استفاده: /adduser [name] [total_reqs] [daily_reqs] [days_limit]\n(برای مقادیر نامحدود از 0 استفاده کنید)" }) });
                     } else {
                         const name = parts[1];
-                        const gb = parts[2] ? parseFloat(parts[2]) : null;
-                        const days = parts[3] ? parseInt(parts[3]) : null;
+                        const tReq = parts[2] && parseInt(parts[2]) > 0 ? parseInt(parts[2]) : null;
+                        const dReq = parts[3] && parseInt(parts[3]) > 0 ? parseInt(parts[3]) : null;
+                        const days = parts[4] && parseInt(parts[4]) > 0 ? parseInt(parts[4]) : null;
                         const newUuid = crypto.randomUUID();
                         if(!sysConfig.users) sysConfig.users = [];
                         sysConfig.users.push({
-                            id: newUuid, name: name, limitGb: gb,
+                            id: newUuid, name: name, limitTotalReq: tReq, limitDailyReq: dReq,
                             expiryMs: days ? Date.now() + days*86400000 : null,
                             createdAt: Date.now()
                         });
                         await d1Put(env, "sys_config", JSON.stringify(sysConfig));
-                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `✅ کاربر جدید اضافه شد.\n\nنام: ${name}\nUUID: ${newUuid}\nحجم: ${gb ? gb + ' GB' : 'نامحدود'}\nاعتبار: ${days ? days + ' روز' : 'نامحدود'}` }) });
+                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `✅ کاربر جدید اضافه شد.\n\nنام: ${name}\nUUID: ${newUuid}\nدرخواست کل: ${tReq ? tReq : 'نامحدود'}\nدرخواست روزانه: ${dReq ? dReq : 'نامحدود'}\nاعتبار: ${days ? days + ' روز' : 'نامحدود'}` }) });
                     }
                 } else if (text.startsWith("/deluser")) {
                     const parts = text.split(" ");
@@ -598,7 +614,6 @@ async function startDataPipe(webSocket, env, ctx) {
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
                     await dataWriter.write(event.data);
-                    if (activeClientHash) trackUsage(activeClientHash, event.data.byteLength, env, ctx);
                 }
             } catch (err) { webSocket.close(); }
         });
@@ -617,6 +632,7 @@ async function startDataPipe(webSocket, env, ctx) {
             if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
             
             activeClientHash = clientHash;
+            trackUsage(activeClientHash, 0, env, ctx);
             
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -642,6 +658,7 @@ async function startDataPipe(webSocket, env, ctx) {
             if (!validProfile) return false;
             
             activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
+            trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
@@ -659,8 +676,23 @@ async function startDataPipe(webSocket, env, ctx) {
             offset = hPos + 4;
         }
 
+        let isDomain = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) || /^[a-zA-Z0-9-]+$/.test(targetAddr);
+        let connectAddr = targetAddr;
+        if (isDomain && sysConfig.customDns) {
+            try {
+                const dohUrl = new URL(sysConfig.customDns);
+                dohUrl.searchParams.set("name", targetAddr);
+                dohUrl.searchParams.set("type", "A");
+                let dnsRes = await fetch(dohUrl.toString(), { headers: { "accept": "application/dns-json" }});
+                let dnsJson = await dnsRes.json();
+                if (dnsJson.Answer && dnsJson.Answer.length > 0) {
+                    connectAddr = dnsJson.Answer[0].data;
+                }
+            } catch (e) {}
+        }
+
         try {
-            remoteSocket = connect({ hostname: targetAddr, port: targetPort });
+            remoteSocket = connect({ hostname: connectAddr, port: targetPort });
             await remoteSocket.opened;
         } catch {
             const fallbackIp = sysConfig.backupRelay || ["pro", "xy", "ip.cmliussss.net"].join("");
@@ -675,10 +707,8 @@ async function startDataPipe(webSocket, env, ctx) {
         if (offset < bufferData.byteLength) {
             let chunk = bufferData.slice(offset);
             await dataWriter.write(chunk);
-            if (activeClientHash) trackUsage(activeClientHash, chunk.byteLength, env, ctx);
         }
         remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { 
-            if (activeClientHash) trackUsage(activeClientHash, chunk.byteLength, env, ctx);
             webSocket.send(chunk); 
         } }));
 
@@ -711,8 +741,12 @@ function getAllProfiles(targetSub = null) {
             let skip = false;
             if (u.expiryMs && now > u.expiryMs) skip = true;
             if (u.isPaused) skip = true;
-            if (u.limitGb && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
-                if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].b >= u.limitGb * 1024 * 1024 * 1024) skip = true;
+            if (u.limitTotalReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
+                if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].reqs >= u.limitTotalReq) skip = true;
+            }
+            if (u.limitDailyReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
+                let usr = sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()];
+                if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
                 list.push({ id: u.id, name: u.name });
@@ -728,22 +762,24 @@ function getAllProfiles(targetSub = null) {
 
 function buildSingleUri(hostName) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     let finalHost = allHostNames[0];
     let finalIP = getCleanIps(finalHost)[0];
-    let sec = getTransportParams(sysConfig.socketPort);
+    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
+    let firstPort = ports[0];
+    let sec = getTransportParams(firstPort);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
     let uriProto = sysConfig.mode === "beta" ? getBeta() : getAlpha();
     let ext = `encryption=none&security=${sec}&sni=${finalHost}&fp=${sysConfig.agent}&type=ws&host=${finalHost}&path=${reqPath}`;
     if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
-    return `${uriProto}://${activeDeviceId}@${finalIP}:${sysConfig.socketPort}?${ext}#${finalHost}`;
+    return `${uriProto}://${activeDeviceId}@${finalIP}:${firstPort}?${ext}#${finalHost}`;
 }
 
 function buildUriProfile(hostName, targetSub = null) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     
-    let sec = getTransportParams(sysConfig.socketPort);
+    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
     
     let lines = [];
@@ -752,19 +788,22 @@ function buildUriProfile(hostName, targetSub = null) {
     profiles.forEach(p => {
         allHostNames.forEach(hName => {
             let ips = getCleanIps(hName);
-            let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
-            if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
-            ips.forEach(ip => {
-                let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
-                let vName = `V-Core-${nameExt}`;
-                let tName = `T-Core-${nameExt}`;
-                
-                if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
-                    lines.push(`${getAlpha()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${vName}`);
-                }
-                if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
-                    lines.push(`${getBeta()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${tName}`);
-                }
+            ports.forEach(port => {
+                let sec = getTransportParams(port);
+                let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
+                if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
+                ips.forEach(ip => {
+                    let nameExt = p.name === "Default" ? `[${ip}:${port}]` : `[${ip}:${port}]-${p.name}`;
+                    let vName = `V-Core-${nameExt}`;
+                    let tName = `T-Core-${nameExt}`;
+                    
+                    if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
+                        lines.push(`${getAlpha()}://${p.id}@${ip}:${port}?${extBase}#${vName}`);
+                    }
+                    if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
+                        lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${extBase}#${tName}`);
+                    }
+                });
             });
         });
     });
@@ -773,9 +812,9 @@ function buildUriProfile(hostName, targetSub = null) {
 
 function buildYamlProfile(hostName, targetSub = null) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(',').map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
     
-    let sec = getTransportParams(sysConfig.socketPort) === "tls" ? "true" : "false";
+    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let proxies = [];
     let proxyNames = [];
     let profiles = getAllProfiles(targetSub);
@@ -783,20 +822,23 @@ function buildYamlProfile(hostName, targetSub = null) {
     profiles.forEach(p => {
         allHostNames.forEach(hName => {
             let ips = getCleanIps(hName);
-            ips.forEach(ip => {
-                let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
-                
-                if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
-                    let vName = `V-Core-${nameExt}`;
-                    proxyNames.push(`"${vName}"`);
-                    proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                }
+            ports.forEach(port => {
+                let sec = getTransportParams(port) === "tls" ? "true" : "false";
+                ips.forEach(ip => {
+                    let nameExt = p.name === "Default" ? `[${ip}:${port}]` : `[${ip}:${port}]-${p.name}`;
+                    
+                    if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
+                        let vName = `V-Core-${nameExt}`;
+                        proxyNames.push(`"${vName}"`);
+                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                    }
 
-                if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
-                    let tName = `T-Core-${nameExt}`;
-                    proxyNames.push(`"${tName}"`);
-                    proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
-                }
+                    if (sysConfig.mode === "beta" || sysConfig.mode === "both") {
+                        let tName = `T-Core-${nameExt}`;
+                        proxyNames.push(`"${tName}"`);
+                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                    }
+                });
             });
         });
     });
@@ -843,7 +885,7 @@ function getDashboardUI(hasDB) {
 
       <!-- Global Controls -->
       <div class="fixed top-4 end-4 md:top-6 md:end-6 flex items-center space-x-2 space-x-reverse z-50">
-          <span id="top-version-badge" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-full text-[11px] font-mono font-bold border border-slate-200 dark:border-darkborder shadow-sm">v2.2.0</span>
+          <span id="top-version-badge" class="px-2.5 py-1 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 rounded-full text-[11px] font-mono font-bold border border-slate-200 dark:border-darkborder shadow-sm">v${CURRENT_VERSION}</span>
           <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="p-2 bg-white/80 dark:bg-darkcard/80 backdrop-blur rounded-full shadow border border-slate-200 dark:border-darkborder text-slate-600 dark:text-slate-400 hover:text-primary transition-all">
               <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
           </a>
@@ -868,7 +910,10 @@ function getDashboardUI(hasDB) {
                   <h2 class="text-3xl font-black text-slate-800 dark:text-white" data-i18n="title">Nahan Gateway</h2>
               </div>
               ${!hasDB ? `<div class="mb-6 p-4 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded-xl text-sm border border-red-100 dark:border-red-900/30"><span data-i18n="missing_db">DB namespace missing!</span></div>` : ''}
-              <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Master Key" class="w-full px-5 py-4 rounded-xl border-2 border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-darkbg focus:border-primary outline-none mb-6 text-center tracking-widest">
+              <div class="relative mb-6">
+                  <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Master Key" class="w-full px-5 py-4 rounded-xl border-2 border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-darkbg focus:border-primary outline-none text-center tracking-widest pe-12">
+                  <button type="button" onclick="const n=document.getElementById('pwd');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+              </div>
               <button onclick="doLogin()" class="w-full bg-primary text-white font-bold py-4 rounded-xl shadow-lg hover:opacity-90" data-i18n="login_btn">Authenticate</button>
               <p id="err-msg" class="text-red-500 text-sm mt-4 hidden text-center font-bold" data-i18n="err_pass">Invalid Key</p>
           </div>
@@ -883,7 +928,7 @@ function getDashboardUI(hasDB) {
                   <div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/40 text-primary flex items-center justify-center me-3 shrink-0"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
                   <div class="flex flex-col">
                       <h1 class="font-black text-xl leading-none" data-i18n="title">Nahan</h1>
-                      <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v2.2.0</span>
+                      <span id="app-version" class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">v${CURRENT_VERSION}</span>
                   </div>
               </div>
               <nav class="flex-1 p-4 space-y-2 overflow-y-auto">
@@ -1024,12 +1069,21 @@ function getDashboardUI(hasDB) {
                                   </select>
                               </div>
                               <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_port">Data Port</label>
-                                  <select id="cfg-port" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
-                                      <option value="443">443 (Secure TLS)</option>
-                                      <option value="8443">8443 (Alt TLS)</option>
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_port">Data Port (Multi-Select)</label>
+                                  <select id="cfg-port" multiple class="w-full h-32 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none text-sm font-mono">
+                                      <option value="443" selected>443 (Secure TLS)</option>
+                                      <option value="2053">2053 (Secure TLS)</option>
+                                      <option value="2083">2083 (Secure TLS)</option>
+                                      <option value="2087">2087 (Secure TLS)</option>
+                                      <option value="2096">2096 (Secure TLS)</option>
+                                      <option value="8443">8443 (Secure TLS)</option>
                                       <option value="80">80 (Standard)</option>
                                       <option value="8080">8080 (Alt Standard)</option>
+                                      <option value="8880">8880 (Alt Standard)</option>
+                                      <option value="2052">2052 (Alt Standard)</option>
+                                      <option value="2082">2082 (Alt Standard)</option>
+                                      <option value="2086">2086 (Alt Standard)</option>
+                                      <option value="2095">2095 (Alt Standard)</option>
                                   </select>
                               </div>
                               <div class="space-y-1 md:col-span-2">
@@ -1042,7 +1096,10 @@ function getDashboardUI(hasDB) {
                               </div>
                               <div class="space-y-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_pass">Master Key</label>
-                                  <input type="text" id="cfg-pass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  <div class="relative">
+                                      <input type="password" id="cfg-pass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none pe-12">
+                                      <button type="button" onclick="const n=document.getElementById('cfg-pass');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                  </div>
                               </div>
                               <div class="space-y-1 md:col-span-2 font-mono">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_github_repo">GitHub Update Repository</label>
@@ -1078,12 +1135,24 @@ function getDashboardUI(hasDB) {
                           </div>
                           
                           <!-- Slave Nodes Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder">
-                              <div class="flex items-center justify-between mb-4">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider">Slave Worker Nodes</h3>
+                          <div class="bg-indigo-50 dark:bg-indigo-900/20 rounded-3xl p-6 shadow-sm border border-indigo-100 dark:border-indigo-900/50 relative overflow-hidden">
+                              <div class="absolute top-0 end-0 bg-indigo-100 dark:bg-indigo-900/40 px-3 py-1 text-[10px] font-bold text-indigo-500 dark:text-indigo-400 rounded-bl-xl">CLUSTER</div>
+                              <div class="flex items-center justify-between mb-2">
+                                  <h3 class="text-sm uppercase font-black text-indigo-800 dark:text-indigo-300 tracking-wider flex items-center">
+                                      <svg class="w-5 h-5 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
+                                      Slave Worker Nodes
+                                  </h3>
                               </div>
-                              <textarea id="cfg-nodes" rows="2" placeholder="node1.worker.dev, node2.worker.dev" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                              <p class="text-xs text-slate-400 mt-2">Enter your other worker URLs (comma-separated). This panel will push configurations to them automatically, and include them in generated subscriptions!</p>
+                              <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 mb-4 leading-relaxed">Enter your other worker Domains (one per line). Master will push settings and users to them automatically, and include them in load-balanced subscriptions!</p>
+                              <div class="relative">
+                                  <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none scrollbar-hide text-slate-700 dark:text-slate-300 placeholder:text-indigo-200 dark:placeholder:text-indigo-800/50"></textarea>
+                                  <div class="absolute bottom-3 end-3">
+                                      <button onclick="forceSyncNodes()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
+                                          <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                          <span id="sync-btn-txt">Force Sync Now</span>
+                                      </button>
+                                  </div>
+                              </div>
                           </div>
   
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -1096,6 +1165,10 @@ function getDashboardUI(hasDB) {
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_dns">Resolver IP</label>
                                   <input type="text" id="cfg-dns" placeholder="1.1.1.1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                              </div>
+                              <div class="space-y-1 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1">Custom DNS (DoH Provider)</label>
+                                  <input type="text" id="cfg-custom-dns" placeholder="https://cloudflare-dns.com/dns-query" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
                               <div class="space-y-1 md:col-span-2 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
@@ -1149,7 +1222,10 @@ function getDashboardUI(hasDB) {
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_token">Token Bot</label>
-                                  <input type="password" id="cfg-tg-token" placeholder="123456:ABC-DEF1234ghIkl-zyx5c" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <div class="relative">
+                                      <input type="password" id="cfg-tg-token" placeholder="123456:ABC-DEF1234ghIkl-zyx5c" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-12">
+                                      <button type="button" onclick="const n=document.getElementById('cfg-tg-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                  </div>
                               </div>
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_chat">Chat ID</label>
@@ -1166,7 +1242,10 @@ function getDashboardUI(hasDB) {
                               </div>
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_cf_token">CF API Token</label>
-                                  <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                  <div class="relative">
+                                      <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
+                                      <button type="button" onclick="const n=document.getElementById('cfg-cf-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                  </div>
                               </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_cf_api">Optional: Monitor Worker free usage limits (100k/day). Needs Account Analytics Read permission.</p>
                           </div>
@@ -1210,8 +1289,12 @@ function getDashboardUI(hasDB) {
                                       <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
                                   <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_gb">Traffic Limit (GB) - Leave empty for unlimited</label>
-                                      <input type="number" step="0.1" id="add-user-gb" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      <label class="block text-xs font-bold text-slate-500 mb-1">Total Requests Limit (Leave empty for unlimited)</label>
+                                      <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  </div>
+                                  <div>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1">Daily Requests Limit (Leave empty for unlimited)</label>
+                                      <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
                                   <div>
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_days">Expiration limit (Days) - Leave empty for unlimited</label>
@@ -1345,6 +1428,21 @@ function getDashboardUI(hasDB) {
           let lang = localStorage.getItem('lang') || 'fa';
           let sessionKey = "", baseRoute = window.location.pathname.split('/dash')[0];
           let hostName = window.location.hostname, localUUID = "";
+
+          window.addEventListener('DOMContentLoaded', () => {
+              let savedSession = localStorage.getItem('nahan_session');
+              if (savedSession) {
+                  try {
+                      let parsed = JSON.parse(savedSession);
+                      if (parsed && parsed.expiry && Date.now() < parsed.expiry) {
+                          sessionKey = parsed.key;
+                          doLogin(true);
+                      } else {
+                          localStorage.removeItem('nahan_session');
+                      }
+                  } catch(e){}
+              }
+          });
   
           function applyLang() {
               document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
@@ -1440,7 +1538,8 @@ function getDashboardUI(hasDB) {
   
           function updateUI() {
               try {
-                  let port = document.getElementById('cfg-port').value;
+                  let portsStr = Array.from(document.getElementById('cfg-port').selectedOptions).map(o=>o.value).join(',');
+                  let port = portsStr ? portsStr.split(',')[0] : '443';
                   let proto = document.getElementById('cfg-proto').value === 'beta' ? String.fromCharCode(116, 114, 111, 106, 97, 110) : String.fromCharCode(118, 108, 101, 115, 115);
                   let rawIps = document.getElementById('cfg-ips').value || "";
                   
@@ -1477,9 +1576,9 @@ function getDashboardUI(hasDB) {
           function exportConfig() {
               const el = id => document.getElementById(id);
               const payload = {
-                  mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
+                  mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                  resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -1505,12 +1604,14 @@ function getDashboardUI(hasDB) {
                       const conf = JSON.parse(e.target.result);
                       const mapId = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined) el.value = val; };
                       mapId('cfg-proto', conf.mode);
-                      mapId('cfg-port', conf.socketPort);
+                      let pList = (conf.socketPorts || conf.socketPort || '443').split(',');
+                      Array.from(document.getElementById('cfg-port').options).forEach(o => o.selected = pList.includes(o.value));
                       mapId('cfg-uuid', conf.deviceId);
                       mapId('cfg-path', conf.apiRoute);
                       mapId('cfg-pass', conf.masterKey);
                       mapId('cfg-fp', conf.agent);
                       mapId('cfg-dns', conf.resolveIp);
+                      mapId('cfg-custom-dns', conf.customDns);
                       mapId('cfg-ips', conf.cleanIps);
                       mapId('cfg-fake', conf.maintenanceHost);
                       mapId('cfg-relay', conf.backupRelay);
@@ -1592,12 +1693,14 @@ function getDashboardUI(hasDB) {
                       
                       const conf = data.config;
                       document.getElementById('cfg-proto').value = conf.mode || 'alpha';
-                      document.getElementById('cfg-port').value = conf.socketPort || '443';
+                      let pList = (conf.socketPorts || conf.socketPort || '443').split(',');
+                      Array.from(document.getElementById('cfg-port').options).forEach(o => o.selected = pList.includes(o.value));
                       document.getElementById('cfg-uuid').value = conf.deviceId || '';
                       document.getElementById('cfg-path').value = conf.apiRoute || '';
                       document.getElementById('cfg-pass').value = conf.masterKey || '';
                       document.getElementById('cfg-fp').value = conf.agent || 'chrome';
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
+                      document.getElementById('cfg-custom-dns').value = conf.customDns || 'https://cloudflare-dns.com/dns-query';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
                       document.getElementById('cfg-nodes').value = conf.slaveNodes || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
@@ -1688,9 +1791,9 @@ function getDashboardUI(hasDB) {
               const payload = {
                   key: sessionKey,
                   config: {
-                      mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
+                      mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -1708,7 +1811,49 @@ function getDashboardUI(hasDB) {
                   } else { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
               } catch(e) { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
           }
-  
+          
+          async function forceSyncNodes() {
+              const nodesRaw = document.getElementById('cfg-nodes').value;
+              if (!nodesRaw || nodesRaw.trim() === '') {
+                  alert('No slave nodes specified.');
+                  return;
+              }
+              const btnTxt = document.getElementById('sync-btn-txt');
+              const icon = document.getElementById('sync-icon');
+              
+              btnTxt.innerText = 'Syncing...';
+              icon.classList.add('animate-spin');
+              
+              const el = id => document.getElementById(id);
+              const payload = {
+                  key: sessionKey,
+                  config: {
+                      mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
+                      apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                      isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
+                      githubRepo: el('cfg-github-repo').value
+                  }
+              };
+              
+              try {
+                  const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
+                  if (res.ok) {
+                      btnTxt.innerText = 'Success!';
+                  } else {
+                      btnTxt.innerText = 'Sync Failed';
+                  }
+              } catch (e) {
+                  btnTxt.innerText = 'Network Error';
+              } finally {
+                  icon.classList.remove('animate-spin');
+                  setTimeout(() => { btnTxt.innerText = 'Force Sync Now'; }, 3000);
+              }
+          }
+
           document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
   
           function renderUsersTable() {
@@ -1722,10 +1867,15 @@ function getDashboardUI(hasDB) {
                   return;
               }
               users.forEach((u, i) => {
-                  let b = usage[u.id.replace(/-/g,'').toLowerCase()]?.b || 0;
-                  let mb = (b / (1024*1024)).toFixed(2);
-                  let limitGbTxt = u.limitGb ? u.limitGb + ' GB' : 'Unlimited';
-                  let per = u.limitGb ? Math.min(100, (b / (u.limitGb * 1024 * 1024 * 1024)) * 100).toFixed(1) + '%' : '-';
+                  let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0, dReqs: 0, lastDay: ''};
+                  let userReqs = sysU.reqs || 0;
+                  let userDReqs = sysU.lastDay === new Date().toISOString().split('T')[0] ? (sysU.dReqs || 0) : 0;
+                  
+                  let limitTotalTxt = u.limitTotalReq ? u.limitTotalReq : 'Unlimited';
+                  let limitDailyTxt = u.limitDailyReq ? u.limitDailyReq : 'Unlimited';
+                  
+                  let perT = u.limitTotalReq ? Math.min(100, (userReqs / u.limitTotalReq) * 100).toFixed(1) + '%' : '-';
+                  let perD = u.limitDailyReq ? Math.min(100, (userDReqs / u.limitDailyReq) * 100).toFixed(1) + '%' : '-';
                   
                   let expTxt = 'Unlimited';
                   let isExp = false;
@@ -1744,7 +1894,7 @@ function getDashboardUI(hasDB) {
                   tr.innerHTML = \`
                       <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${u.isPaused ? '⏸️' : (isExp ? '🔴' : '🟢')}</td>
                       <td class="px-4 py-4 font-mono text-xs text-slate-500 select-all">\${u.id}</td>
-                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono"><div class="flex flex-col"><span class="font-bold">\${mb} MB</span><span class="text-xs opacity-70">Limit: \${limitGbTxt} (\${per})</span></div></td>
+                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono"><div class="flex flex-col"><span class="font-bold">Total: \${userReqs} / \${limitTotalTxt} (\${perT})</span><span class="text-xs opacity-70">Daily: \${userDReqs} / \${limitDailyTxt} (\${perD})</span></div></td>
                       <td class="px-4 py-4 text-slate-600 dark:text-slate-400">\${expTxt}</td>
                       <td class="px-4 py-4 text-end space-x-2 space-x-reverse">
                           <input type="hidden" id="sync-\${u.id}" value="\${window.nahanProfiles.find(p => p.id === u.id)?.sync || ''}">
@@ -1781,11 +1931,13 @@ function getDashboardUI(hasDB) {
 
           function commitAddUser() {
               const name = document.getElementById('add-user-name').value;
-              let gb = document.getElementById('add-user-gb').value;
+              let tReq = document.getElementById('add-user-total-reqs').value;
+              let dReq = document.getElementById('add-user-daily-reqs').value;
               let days = document.getElementById('add-user-days').value;
               
               if(!name) { alert('Please enter a name'); return; }
-              gb = gb ? parseFloat(gb) : null;
+              tReq = tReq ? parseInt(tReq) : null;
+              dReq = dReq ? parseInt(dReq) : null;
               days = days ? parseInt(days) : null;
               
               if(!window.nahanConfig) window.nahanConfig = {};
@@ -1797,7 +1949,8 @@ function getDashboardUI(hasDB) {
               const u = {
                   id: newId,
                   name: name,
-                  limitGb: gb,
+                  limitTotalReq: tReq,
+                  limitDailyReq: dReq,
                   expiryMs: days ? Date.now() + days*86400000 : null,
                   createdAt: Date.now()
               };
@@ -1805,7 +1958,8 @@ function getDashboardUI(hasDB) {
               window.nahanConfig.users.push(u);
               document.getElementById('modal-add-user').classList.add('hidden');
               document.getElementById('add-user-name').value = '';
-              document.getElementById('add-user-gb').value = '';
+              document.getElementById('add-user-total-reqs').value = '';
+              document.getElementById('add-user-daily-reqs').value = '';
               document.getElementById('add-user-days').value = '';
               
               renderUsersTable();
@@ -1861,9 +2015,9 @@ function getDashboardUI(hasDB) {
                   if (remoteVer) {
                       const strip = v => v.replace(/^v/, '').trim();
                       const rVer = strip(remoteVer);
-                      const cVer = strip("2.1.0");
+                      const cVer = strip("2.3.0");
                       
-                      if (rVer && rVer !== cVer) {
+                      if (rVer && rVer >= cVer) {
                           showUpdateBanner(repo, rVer);
                       }
                   }
